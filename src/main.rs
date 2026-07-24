@@ -5,10 +5,11 @@ fn main() {
         .ok()
         .map(|scale| {
             scale
-                .parse::<u32>()
+                .parse::<f32>()
                 .ok()
-                .filter(|scale| *scale > 0)
-                .expect("XWAYLAND_SATELLITE_CURSOR_SCALE must be a positive integer")
+                .filter(|scale| *scale > 0.0)
+                .map(|scale| scale.round() as u32)
+                .expect("XWAYLAND_SATELLITE_CURSOR_SCALE must be a positive number")
         });
 
     if let Some(scale) = cursor_scale {
