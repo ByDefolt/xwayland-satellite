@@ -138,6 +138,11 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
             }
             Request::<WlSurface>::Commit => {
                 if configured {
+                    if data.has::<CursorSurface>()
+                        && let Some(scale) = state.cursor_scale
+                    {
+                        client.set_buffer_scale(scale);
+                    }
                     client.commit();
                 }
             }
@@ -167,6 +172,11 @@ impl<S: X11Selection> Dispatch<WlSurface, Entity> for InnerServerState<S> {
                 }
             }
             Request::<WlSurface>::SetBufferScale { scale } => {
+                let scale = if data.has::<CursorSurface>() {
+                    state.cursor_scale.unwrap_or(scale)
+                } else {
+                    scale
+                };
                 client.set_buffer_scale(scale);
             }
             Request::<WlSurface>::SetInputRegion { region } => {
@@ -358,20 +368,35 @@ impl<S: X11Selection> Dispatch<WlPointer, Entity> for InnerServerState<S> {
                 hotspot_y,
                 surface,
             } => {
+                let surface_entity = surface.as_ref().and_then(|surface| surface.data().copied());
+                if let Some(surface_entity) = surface_entity {
+                    state
+                        .world
+                        .insert_one(surface_entity, CursorSurface)
+                        .unwrap();
+                }
+
                 let c_pointer = state
                     .world
                     .get::<&client::wl_pointer::WlPointer>(*entity)
                     .unwrap();
 
-                let c_surface = surface.and_then(|s| {
-                    let e = s.data().copied()?;
-                    Some(
-                        state
-                            .world
-                            .get::<&client::wl_surface::WlSurface>(e)
-                            .unwrap(),
-                    )
+                let c_surface = surface_entity.map(|entity| {
+                    state
+                        .world
+                        .get::<&client::wl_surface::WlSurface>(entity)
+                        .unwrap()
                 });
+
+                if let (Some(c_surface), Some(scale)) = (c_surface.as_deref(), state.cursor_scale) {
+                    c_surface.set_buffer_scale(scale);
+                    c_surface.commit();
+                }
+
+                let (hotspot_x, hotspot_y) = state
+                    .cursor_scale
+                    .map(|scale| (hotspot_x / scale, hotspot_y / scale))
+                    .unwrap_or((hotspot_x, hotspot_y));
                 c_pointer.set_cursor(serial, c_surface.as_deref(), hotspot_x, hotspot_y);
             }
             Request::<WlPointer>::Release => {

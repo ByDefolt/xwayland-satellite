@@ -182,6 +182,8 @@ struct SurfaceAttach {
     y: i32,
 }
 
+struct CursorSurface;
+
 #[derive(PartialEq, Eq, Debug)]
 struct SurfaceSerial([u32; 2]);
 
@@ -483,6 +485,7 @@ pub struct InnerServerState<S: X11Selection> {
     global_offset_updated: bool,
     updated_outputs: Vec<Entity>,
     new_scale: Option<f64>,
+    cursor_scale: Option<i32>,
 }
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
@@ -591,6 +594,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             global_offset_updated: false,
             updated_outputs: Vec::new(),
             new_scale: None,
+            cursor_scale: None,
             decoration_manager,
             world,
         };
@@ -1350,6 +1354,10 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
     pub fn new_global_scale(&mut self) -> Option<f64> {
         self.new_scale.take()
+    }
+
+    pub fn set_cursor_scale(&mut self, scale: Option<i32>) {
+        self.cursor_scale = scale;
     }
 
     fn handle_activations(&mut self) {

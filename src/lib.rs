@@ -51,6 +51,9 @@ pub trait RunData {
     fn max_req_len_bytes(&self) -> Option<usize> {
         None
     }
+    fn cursor_scale(&self) -> Option<i32> {
+        None
+    }
 }
 
 pub const fn timespec_from_millis(millis: u64) -> Timespec {
@@ -154,6 +157,7 @@ pub fn main(mut data: impl RunData) -> Option<()> {
     };
 
     let mut server_state = EarlyServerState::new(dh, data.server(), connection);
+    server_state.set_cursor_scale(data.cursor_scale());
     server_state.run();
 
     // Remove the lifetimes on our fds to avoid borrowing issues, since we know they will exist for

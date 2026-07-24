@@ -1,11 +1,33 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 fn main() {
+    let cursor_scale = std::env::var("XWAYLAND_SATELLITE_CURSOR_SCALE")
+        .ok()
+        .map(|scale| {
+            scale
+                .parse::<u32>()
+                .ok()
+                .filter(|scale| *scale > 0)
+                .expect("XWAYLAND_SATELLITE_CURSOR_SCALE must be a positive integer")
+        });
+
+    if let Some(scale) = cursor_scale {
+        let base_size = std::env::var("XCURSOR_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(24);
+        let scaled_size = base_size * scale;
+        unsafe {
+            std::env::set_var("XCURSOR_SIZE", scaled_size.to_string());
+        }
+    }
     pretty_env_logger::formatted_timed_builder()
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();
-    xwayland_satellite::main(parse_args());
+    let mut data = parse_args();
+    data.cursor_scale = cursor_scale.map(|scale| scale as i32);
+    xwayland_satellite::main(data);
 }
 
 #[derive(Default)]
@@ -13,6 +35,7 @@ struct RealData {
     display: Option<String>,
     listenfds: Vec<OwnedFd>,
     flags: Vec<String>,
+    cursor_scale: Option<i32>,
 }
 impl xwayland_satellite::RunData for RealData {
     fn display(&self) -> Option<&str> {
@@ -25,6 +48,10 @@ impl xwayland_satellite::RunData for RealData {
 
     fn flags(&self) -> &[String] {
         &self.flags
+    }
+
+    fn cursor_scale(&self) -> Option<i32> {
+        self.cursor_scale
     }
 }
 
