@@ -1,29 +1,17 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 fn main() {
-    let cursor_scale = std::env::var("XWAYLAND_SATELLITE_CURSOR_SCALE")
-        .ok()
-        .map(|scale| {
-            scale
-                .parse::<f32>()
-                .ok()
-                .filter(|scale| *scale > 0.0)
-                .map(|scale| scale.round() as u32)
-                .expect("XWAYLAND_SATELLITE_CURSOR_SCALE must be a positive number")
-        });
-
-    if let Some(scale) = cursor_scale {
+    let arg_data = parse_args();
+    if let Some(scale) = arg_data.cursor_scale {
         let base_size = std::env::var("XCURSOR_SIZE")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(24);
-        let scaled_size = base_size * scale;
+        let scaled_size = base_size.saturating_mul(scale as u32);
         unsafe {
             std::env::set_var("XCURSOR_SIZE", scaled_size.to_string());
         }
     }
-    let mut arg_data = parse_args();
-    arg_data.cursor_scale = cursor_scale.map(|scale| scale as i32);
     init_logger(!arg_data.listenfds.is_empty());
     xwayland_satellite::main(arg_data);
 }
@@ -157,6 +145,18 @@ fn parse_args() -> RealData {
                     .expect("Could not open authorization file");
                 flags.auth_file = Some(file.to_owned());
             }
+            "--cursor-scale" | "-cursor-scale" => {
+                let scale = args
+                    .next()
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|scale| {
+                        scale.is_finite()
+                            && scale.round() >= 1.0
+                            && scale.round() <= i32::MAX as f64
+                    })
+                    .expect("argument to --cursor-scale must be a positive number rounding to 1..=2147483647");
+                data.cursor_scale = Some(scale.round() as i32);
+            }
             "-core" => {
                 flags.coredump = true;
             }
@@ -196,6 +196,10 @@ fn parse_args() -> RealData {
                 println!(
                     "{:<25} generate core dump of Xwayland on fatal error",
                     "-core"
+                );
+                println!(
+                    "{:<25} set cursor scale (positive number rounded to an integer)",
+                    "--cursor-scale <scale>"
                 );
                 println!("{:<25} Enable extension", "+extension name");
                 println!("{:<25} Disable extension", "-extension name");
