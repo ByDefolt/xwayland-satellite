@@ -22,13 +22,10 @@ fn main() {
             std::env::set_var("XCURSOR_SIZE", scaled_size.to_string());
         }
     }
-    pretty_env_logger::formatted_timed_builder()
-        .filter_level(log::LevelFilter::Info)
-        .parse_default_env()
-        .init();
-    let mut data = parse_args();
-    data.cursor_scale = cursor_scale.map(|scale| scale as i32);
-    xwayland_satellite::main(data);
+    let mut arg_data = parse_args();
+    arg_data.cursor_scale = cursor_scale.map(|scale| scale as i32);
+    init_logger(!arg_data.listenfds.is_empty());
+    xwayland_satellite::main(arg_data);
 }
 
 #[derive(Default)]
@@ -273,4 +270,34 @@ fn parse_args() -> RealData {
     data.flags = flags.to_vec();
 
     data
+}
+
+fn init_logger(integrated: bool) {
+    if integrated {
+        match syslog::unix(syslog::Formatter3164::default()) {
+            Ok(syslog) => {
+                log::set_boxed_logger(Box::new(syslog::BasicLogger::new(syslog))).unwrap();
+                log::set_max_level(log::LevelFilter::Debug);
+                std::panic::set_hook(Box::new(|info| {
+                    let thread = std::thread::current();
+                    let name = thread.name().unwrap_or("<unnamed");
+                    let location = info.location().unwrap();
+                    log::error!("thread '{name}' panicked at {location}:");
+                    if let Some(s) = info.payload().downcast_ref::<&str>() {
+                        log::error!("{s}");
+                    } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                        log::error!("{s}");
+                    }
+                }));
+                return;
+            }
+            Err(e) => {
+                eprintln!("failed to start syslog: {e:?}");
+            }
+        };
+    }
+    pretty_env_logger::formatted_timed_builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .init();
 }

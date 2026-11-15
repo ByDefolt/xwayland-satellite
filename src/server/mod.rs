@@ -7,7 +7,9 @@ pub(crate) mod selection;
 mod tests;
 
 use self::event::*;
-use crate::xstate::{Decorations, MoveResizeDirection, WindowDims, WmHints, WmName, WmNormalHints};
+use crate::xstate::{
+    Decorations, MoveResizeDirection, WindowDims, WindowRole, WmHints, WmName, WmNormalHints,
+};
 use crate::{X11Selection, XConnection, timespec_from_millis};
 use clientside::MyWorld;
 use decoration::{DecorationsData, DecorationsDataSatellite};
@@ -99,9 +101,10 @@ where
 
 #[derive(Default, Debug)]
 struct WindowAttributes {
-    is_popup: bool,
-    acquire_input_via_wm: bool,
+    accepts_input: bool,
     has_take_focus: bool,
+    role: WindowRole,
+    override_redirect: bool,
     dims: WindowDims,
     size_hints: Option<WmNormalHints>,
     title: Option<WmName>,
@@ -112,9 +115,8 @@ struct WindowAttributes {
 }
 
 impl WindowAttributes {
-    /// AKA "Passive" input model
     fn require_wm_focus(&self) -> bool {
-        self.acquire_input_via_wm && !self.has_take_focus
+        !self.override_redirect && (self.has_take_focus || self.accepts_input)
     }
 }
 
@@ -137,7 +139,8 @@ impl WindowData {
         Self {
             mapped: false,
             attrs: WindowAttributes {
-                is_popup: override_redirect,
+                role: WindowRole::new_basic(override_redirect),
+                override_redirect,
                 dims,
                 ..Default::default()
             },
@@ -398,6 +401,7 @@ struct FocusData {
     window: x::Window,
     output_name: Option<String>,
     is_popup: bool,
+    has_take_focus: bool,
 }
 
 #[derive(Copy, Clone, Default)]
@@ -421,6 +425,9 @@ impl<S: X11Selection> XConnection for NoConnection<S> {
     type X11Selection = S;
     fn focus_window(&mut self, _: x::Window, _: Option<String>) {
         debug!("could not focus window without XWayland initialized");
+    }
+    fn send_take_focus(&mut self, _: x::Window) {
+        debug!("could not send take focus without XWayland initialized");
     }
     fn close_window(&mut self, _: x::Window) {
         debug!("could not close window without XWayland initialized");
@@ -486,6 +493,7 @@ pub struct InnerServerState<S: X11Selection> {
     updated_outputs: Vec<Entity>,
     new_scale: Option<f64>,
     cursor_scale: Option<i32>,
+    current_scale: f64,
 }
 
 impl<S: X11Selection> ServerState<NoConnection<S>> {
@@ -595,6 +603,7 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
             updated_outputs: Vec::new(),
             new_scale: None,
             cursor_scale: None,
+            current_scale: 1.0,
             decoration_manager,
             world,
         };
@@ -733,6 +742,7 @@ impl<C: XConnection> ServerState<C> {
 
                 debug!("Using new scale {scale}");
                 self.new_scale = Some(scale);
+                self.current_scale = scale;
             }
         }
 
@@ -741,15 +751,20 @@ impl<C: XConnection> ServerState<C> {
                 window,
                 output_name,
                 is_popup,
+                has_take_focus,
             }) = self.to_focus.take()
             {
                 debug!(
-                    "focusing {} {window:?}",
+                    "focusing (take_focus={has_take_focus:?}) {} {window:?}",
                     if is_popup { "popup" } else { "window" }
                 );
-                self.connection.focus_window(window, output_name);
-                if !is_popup {
-                    self.last_focused_toplevel = Some(window);
+                if has_take_focus {
+                    self.connection.send_take_focus(window);
+                } else {
+                    self.connection.focus_window(window, output_name);
+                    if !is_popup {
+                        self.last_focused_toplevel = Some(window);
+                    }
                 }
             } else if self.unfocus {
                 self.connection.focus_window(x::WINDOW_NONE, None);
@@ -887,9 +902,11 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         self.windows.insert(window, id);
     }
 
-    pub fn set_popup(&mut self, window: x::Window, is_popup: bool) {
+    pub fn set_override_redirect(&mut self, window: x::Window, override_redirect: bool) {
         let Some(id) = self.windows.get(&window).copied() else {
-            debug!("not setting popup for unknown window {window:?}");
+            debug!(
+                "not setting override_redirect {override_redirect} for unknown window {window:?}"
+            );
             return;
         };
 
@@ -897,7 +914,16 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             .get::<&mut WindowData>(id)
             .unwrap()
             .attrs
-            .is_popup = is_popup;
+            .override_redirect = override_redirect;
+    }
+
+    pub fn set_window_role(&mut self, window: x::Window, role: WindowRole) {
+        let Some(id) = self.windows.get(&window).copied() else {
+            debug!("not setting role {role:?} for unknown window {window:?}");
+            return;
+        };
+
+        self.world.get::<&mut WindowData>(id).unwrap().attrs.role = role;
     }
 
     pub fn set_win_title(&mut self, window: x::Window, name: WmName) {
@@ -972,7 +998,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         let attrs = &mut self.world.get::<&mut WindowData>(id).unwrap().attrs;
         attrs.group = hints.window_group;
-        attrs.acquire_input_via_wm = hints.acquire_input_via_wm;
+        attrs.accepts_input = hints.accepts_input;
     }
 
     pub fn set_take_focus(&mut self, window: x::Window, has_take_focus: bool) {
@@ -1002,27 +1028,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             debug!("setting {window:?} hints {hints:?}");
             let mut query = data.query::<(&SurfaceRole, &SurfaceScaleFactor)>();
             if let Some((SurfaceRole::Toplevel(Some(data)), scale_factor)) = query.get() {
-                let decorations_height = if data.decoration.satellite.is_some() {
-                    DecorationsDataSatellite::TITLEBAR_HEIGHT
-                } else {
-                    0
-                };
-                if let Some(min_size) = &hints.min_size {
-                    data.toplevel.set_min_size(
-                        (min_size.width as f64 / scale_factor.0) as i32,
-                        (min_size.height as f64 / scale_factor.0) as i32 + decorations_height,
-                    );
-                } else {
-                    data.toplevel.set_min_size(0, 0);
-                }
-                if let Some(max_size) = &hints.max_size {
-                    data.toplevel.set_max_size(
-                        (max_size.width as f64 / scale_factor.0) as i32,
-                        (max_size.height as f64 / scale_factor.0) as i32 + decorations_height,
-                    );
-                } else {
-                    data.toplevel.set_max_size(0, 0);
-                }
+                event::update_size_hints(data, &hints, scale_factor.0);
             }
             win.attrs.size_hints = Some(hints);
         }
@@ -1074,7 +1080,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             return true;
         };
 
-        !win.mapped || win.attrs.is_popup
+        !win.mapped || win.attrs.role.is_popup()
     }
 
     pub fn reconfigure_window(&mut self, event: x::ConfigureNotifyEvent) {
@@ -1097,7 +1103,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         };
         if dims == win.attrs.dims {
             return;
-        } else if win.attrs.is_popup {
+        } else if win.attrs.role.is_popup() {
             win.attrs.dims = dims;
         }
 
@@ -1124,8 +1130,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                     ((event.y() as i32 - win.output_offset.y) as f64 / scale_factor.0) as i32,
                 );
                 popup.positioner.set_size(
-                    1.max((event.width() as f64 / scale_factor.0) as i32),
-                    1.max((event.height() as f64 / scale_factor.0) as i32),
+                    1.max((event.width() as f64 / scale_factor.0).ceil() as i32),
+                    1.max((event.height() as f64 / scale_factor.0).ceil() as i32),
                 );
                 popup.popup.reposition(&popup.positioner, 0);
             }
@@ -1404,6 +1410,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         let xdg_surface;
         let mut popup_for = None;
         let mut fullscreen = false;
+        let splash;
 
         {
             let data = self.world.entity(entity).unwrap();
@@ -1414,9 +1421,10 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             xdg_surface = self.xdg_wm_base.get_xdg_surface(&surface, &self.qh, entity);
 
             let window_data = data.get::<&WindowData>().unwrap();
-            if window_data.attrs.is_popup {
+            if window_data.attrs.role.is_popup() {
                 popup_for = self.last_hovered.or(self.last_focused_toplevel);
             }
+            splash = window_data.attrs.role == WindowRole::Splash;
 
             let (width, height) = (window_data.attrs.dims.width, window_data.attrs.dims.height);
             for (_, dimensions) in self.world.query::<&OutputDimensions>().iter() {
@@ -1432,7 +1440,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             let data = self.create_popup(entity, xdg_surface, parent);
             (SurfaceRole::Popup(Some(data)), false)
         } else {
-            let data = self.create_toplevel(entity, xdg_surface, fullscreen);
+            let data = self.create_toplevel(entity, xdg_surface, fullscreen, splash);
             (SurfaceRole::Toplevel(Some(data)), true)
         };
 
@@ -1461,6 +1469,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         entity: Entity,
         xdg: XdgSurface,
         fullscreen: bool,
+        splash: bool,
     ) -> ToplevelData {
         let window = self.world.get::<&WindowData>(entity).unwrap();
         debug!(
@@ -1476,6 +1485,15 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             if let Some(max) = &hints.max_size {
                 toplevel.set_max_size(max.width, max.height);
             }
+        }
+        // Application splash windows are usually startup displays, so reporting their dimensions
+        // as fixed has no downside. The upside is tiling Wayland compositors use fixed size as a
+        // heurisitc to display those windows on a seperate floating level.
+        // https://yalter.github.io/niri/Floating-Windows.html
+        if splash {
+            let dims = window.attrs.dims;
+            toplevel.set_min_size(dims.width.into(), dims.height.into());
+            toplevel.set_max_size(dims.width.into(), dims.height.into());
         }
 
         let group = window.attrs.group.and_then(|win| {
@@ -1612,8 +1630,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         let positioner = self.xdg_wm_base.create_positioner(&self.qh, ());
         positioner.set_size(
-            1.max((window.attrs.dims.width as f64 / initial_scale) as i32),
-            1.max((window.attrs.dims.height as f64 / initial_scale) as i32),
+            1.max((window.attrs.dims.width as f64 / initial_scale).ceil() as i32),
+            1.max((window.attrs.dims.height as f64 / initial_scale).ceil() as i32),
         );
         let x = ((window.attrs.dims.x - parent_dims.x) as f64 / initial_scale) as i32;
         let y = ((window.attrs.dims.y - parent_dims.y) as f64 / initial_scale) as i32;
@@ -1623,8 +1641,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         positioner.set_anchor_rect(
             0,
             0,
-            (parent_window.attrs.dims.width as f64 / initial_scale) as i32,
-            (parent_window.attrs.dims.height as f64 / initial_scale) as i32,
+            (parent_window.attrs.dims.width as f64 / initial_scale).ceil() as i32,
+            (parent_window.attrs.dims.height as f64 / initial_scale).ceil() as i32,
         );
         positioner
             .set_constraint_adjustment(ConstraintAdjustment::SlideX | ConstraintAdjustment::SlideY);

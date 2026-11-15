@@ -295,7 +295,7 @@ impl SurfaceEvents {
                 &SurfaceScaleFactor,
                 &x::Window,
                 &mut WindowData,
-                &mut SurfaceRole,
+                &SurfaceRole,
             )>();
             let (scale_factor, window, window_data, role) = query.get().unwrap();
 
@@ -307,8 +307,19 @@ impl SurfaceEvents {
             } else {
                 window_data.attrs.dims.width
             };
-            let mut height = if pending.height > 0 {
-                (pending.height as f64 * scale_factor.0) as u16
+            let height = if pending.height > 0 {
+                let mut logical_height = pending.height;
+                if let SurfaceRole::Toplevel(Some(toplevel)) = role {
+                    if let Some(d) = &toplevel.decoration.satellite {
+                        let surface_width = (width as f64 / scale_factor.0).ceil() as i32;
+                        if d.will_draw_decorations(surface_width) {
+                            logical_height = (logical_height
+                                - DecorationsDataSatellite::TITLEBAR_HEIGHT)
+                                .max(DecorationsDataSatellite::TITLEBAR_HEIGHT);
+                        }
+                    }
+                }
+                (logical_height as f64 * scale_factor.0) as u16
             } else {
                 window_data.attrs.dims.height
             };
@@ -316,20 +327,6 @@ impl SurfaceEvents {
                 "configuring {} ({window:?}): {x}x{y}, {width}x{height}",
                 data.get::<&WlSurface>().unwrap().id(),
             );
-
-            if let SurfaceRole::Toplevel(Some(toplevel)) = &*role {
-                if let Some(d) = &toplevel.decoration.satellite {
-                    let surface_width = (width as f64 / scale_factor.0) as i32;
-                    if d.will_draw_decorations(surface_width) {
-                        height = height
-                            .saturating_sub(
-                                (DecorationsDataSatellite::TITLEBAR_HEIGHT as f64 * scale_factor.0)
-                                    as u16,
-                            )
-                            .max(DecorationsDataSatellite::TITLEBAR_HEIGHT as u16);
-                    }
-                }
-            }
 
             window_data.attrs.dims = WindowDims {
                 x: x as i16,
@@ -457,6 +454,7 @@ impl SurfaceEvents {
                             window,
                             output_name: None,
                             is_popup: true,
+                            has_take_focus: window_data.attrs.has_take_focus,
                         });
                     }
                 }
@@ -505,32 +503,33 @@ pub(super) fn update_surface_viewport(
     debug!("{} viewport: {width}x{height}", surface.id());
 
     if let Some(hints) = size_hints {
-        let Some(data) = toplevel_data else {
-            return;
+        if let Some(data) = toplevel_data {
+            update_size_hints(data, hints, scale_factor.0);
         };
+    }
+}
 
-        let decorations_height = if data.decoration.satellite.is_some() {
-            DecorationsDataSatellite::TITLEBAR_HEIGHT
-        } else {
-            0
-        };
-
-        if let Some(min) = hints.min_size {
-            debug!(
-                "updated min height: {}",
-                (min.height as f64 / scale_factor.0) as i32 + decorations_height
-            );
-            data.toplevel.set_min_size(
-                (min.width as f64 / scale_factor.0) as i32,
-                (min.height as f64 / scale_factor.0) as i32 + decorations_height,
-            );
-        }
-        if let Some(max) = hints.max_size {
-            data.toplevel.set_max_size(
-                (max.width as f64 / scale_factor.0) as i32,
-                (max.height as f64 / scale_factor.0) as i32 + decorations_height,
-            );
-        }
+pub(super) fn update_size_hints(data: &ToplevelData, hints: &WmNormalHints, scale: f64) {
+    let decorations_height = if data.decoration.satellite.is_some() {
+        DecorationsDataSatellite::TITLEBAR_HEIGHT
+    } else {
+        0
+    };
+    if let Some(min_size) = &hints.min_size {
+        data.toplevel.set_min_size(
+            (min_size.width as f64 / scale) as i32,
+            ((min_size.height as f64 / scale) as i32).saturating_add(decorations_height),
+        );
+    } else {
+        data.toplevel.set_min_size(0, 0);
+    }
+    if let Some(max_size) = &hints.max_size {
+        data.toplevel.set_max_size(
+            (max_size.width as f64 / scale) as i32,
+            ((max_size.height as f64 / scale) as i32).saturating_add(decorations_height),
+        );
+    } else {
+        data.toplevel.set_max_size(0, 0);
     }
 }
 
@@ -869,10 +868,13 @@ impl Event for client::wl_keyboard::Event {
                     serial,
                 ));
                 let output_name = get_output_name(output, &state.world);
+                let window_data = data.get::<&WindowData>();
+                let has_take_focus = window_data.as_ref().is_some_and(|d| d.attrs.has_take_focus);
                 state.to_focus = Some(FocusData {
                     window: *window,
                     output_name,
                     is_popup: false,
+                    has_take_focus,
                 });
                 keyboard.enter(serial, surface, keys);
             }
@@ -1317,10 +1319,11 @@ impl OutputEvent {
                 height,
                 refresh,
             } => {
-                let Ok((output, dimensions)) = state
-                    .world
-                    .query_one_mut::<(&WlOutput, &mut OutputDimensions)>(target)
-                else {
+                let Ok((output, dimensions, xdg)) = state.world.query_one_mut::<(
+                    &WlOutput,
+                    &mut OutputDimensions,
+                    Option<&XdgOutputServer>,
+                )>(target) else {
                     return;
                 };
 
@@ -1333,6 +1336,13 @@ impl OutputEvent {
                     debug!("{} dimensions: {width}x{height}", output.id());
                 }
                 output.mode(convert_wenum(flags), width, height, refresh);
+                if let Some(xdg) = xdg {
+                    if dimensions.rotated_90 {
+                        xdg.logical_size(dimensions.height, dimensions.width);
+                    } else {
+                        xdg.logical_size(dimensions.width, dimensions.height);
+                    }
+                }
             }
             Event::Scale { factor } => {
                 debug!(
@@ -1357,11 +1367,22 @@ impl OutputEvent {
                     .name(name.clone());
                 state.world.insert(target, (OutputName(name),)).unwrap();
             }
+            Event::Done {} => {
+                let Ok((output, xdg)) = state
+                    .world
+                    .query_one_mut::<(&WlOutput, Option<&XdgOutputServer>)>(target)
+                else {
+                    return;
+                };
+                if let Some(xdg) = xdg {
+                    xdg.done();
+                }
+                output.done();
+            }
             _ => simple_event_shunt! {
                 state.world.get::<&WlOutput>(target).unwrap(),
                 event: client::wl_output::Event => [
                     Description { description },
-                    Done
                 ]
             },
         }

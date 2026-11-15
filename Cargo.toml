@@ -17,7 +17,7 @@ edition = "2024"
 
 [package]
 name = "xwayland-satellite"
-version = "0.8.1"
+version = "0.8.3"
 authors = ["Shawn Wallace"]
 license = "MPL-2.0"
 description = "xwayland-satellite grants rootless Xwayland integration to any Wayland compositor implementing xdg_wm_base and viewporter. This is particularly useful for compositors that (understandably) do not want to go through implementing support for rootless Xwayland themselves."
@@ -40,6 +40,7 @@ xcb = { version = "1.7.0", features = ["composite", "randr", "res"] }
 wl_drm = { path = "wl_drm" }
 log = "0.4.21"
 pretty_env_logger = "0.5.0"
+syslog = "7.0.0"
 xcb-util-cursor = "0.4"
 smithay-client-toolkit = { version = "0.20.0", default-features = false }
 
@@ -50,7 +51,7 @@ hecs = { version = "0.10.5", features = ["macros"] }
 num_enum = "0.7.4"
 tiny-skia = "0.11.4"
 ab_glyph = "0.2.32"
-fontdue = "0.9.3"
+async-channel = "2.5.0"
 
 [features]
 default = []
